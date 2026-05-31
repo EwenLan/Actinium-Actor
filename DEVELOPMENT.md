@@ -87,15 +87,41 @@
 
 ---
 
-## Phase 4: Supervisor Actor 🔜
+## Phase 4: Supervisor Actor ✅
 
-**Goal**: A supervisor actor that spawns and monitors child actors with restart strategies.
+**Status**: Complete
 
-**Pending**:
-- [ ] `Supervisor` actor with OneForOne / AllForOne strategies
-- [ ] Child failure detection and restart
-- [ ] Context::spawn for spawning actors from within actors
-- [ ] Tests for supervisor behavior
+### New Modules
+| File | Purpose |
+|------|---------|
+| `src/supervisor.rs` | `Supervisor` with restart strategies, `Context::spawn` support |
+
+### Design
+- `Supervisor` manages child actors via factory functions
+- `Strategy::OneForOne` restarts only the failed child (up to `max_restarts`)
+- `Strategy::AllForOne` restarts all children when one fails
+- `Context::spawn()` allows actors to spawn children directly into the worker's actor map
+- Panic isolation via `catch_unwind` in Worker — panics don't crash workers
+- Children are spawned on the same worker as the parent (no deadlock)
+
+### API
+```rust
+let mut sup = Supervisor::new(Strategy::OneForOne, 3);
+sup.register_child(|ctx| { ctx.spawn(child_actor).id() });
+sup.start_all(ctx);  // spawn initial children
+sup.handle_failure(failed_id, ctx);  // restart on failure
+```
+
+### Tests: 4 new (32 total across all modules)
+- Supervisor registers and starts children
+- OneForOne restarts failed child with new ActorId
+- OneForOne stops child after max_restarts exceeded
+- Child factory spawns via Context::spawn
+
+### Architecture Changes
+- `SpawnShared` refactored with shared `ActorMap` for direct spawns
+- `Context::spawn()` uses `spawn_actor_direct()` — no channels, no deadlock
+- Worker removes actor from map during dispatch, re-inserts if still running
 
 ---
 
