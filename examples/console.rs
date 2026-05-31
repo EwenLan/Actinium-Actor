@@ -1,6 +1,13 @@
-//! Console-based actor management REPL with state machine workers.
+//! Console-based actor management REPL with MetaActor supervision.
 //!
-//! Each worker actor cycles through states:
+//! Architecture:
+//!   stdin → CommandActor → MetaActor → WorkerActor(s)
+//!
+//! The MetaActor is automatically started on startup and manages all
+//! worker lifecycle (create/destroy). The CommandActor delegates
+//! spawn/stop operations to the MetaActor via message interfaces.
+//!
+//! Each worker cycles through states:
 //!   Idle → Receiving → Processing → Idle → ...
 //!
 //! Commands:
@@ -25,17 +32,13 @@ use actinium_actor::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkerState {
-    /// Waiting for the first message.
     Idle,
-    /// Receiving a message.
     Receiving,
-    /// Processing the received message.
     Processing,
 }
 
-// ── Worker Actor ────────────────────────────────────────────
+// ── Worker Info ─────────────────────────────────────────────
 
-/// Shared state for querying worker status without blocking sends.
 #[derive(Debug, Clone)]
 struct WorkerInfo {
     name: String,
@@ -43,6 +46,8 @@ struct WorkerInfo {
     last_msg: String,
     current_state: String,
 }
+
+// ── Worker Actor ────────────────────────────────────────────
 
 type WorkerSM = StateMachine<WorkerActor, WorkerMessage, WorkerState>;
 
@@ -80,11 +85,9 @@ impl StateHandler<WorkerMessage, WorkerState> for WorkerActor {
     fn initial_state() -> WorkerState {
         WorkerState::Idle
     }
-
     fn state_sequence() -> Vec<WorkerState> {
         vec![WorkerState::Idle, WorkerState::Receiving, WorkerState::Processing]
     }
-
     fn handle_in_state(
         &mut self,
         _idx: usize,
@@ -96,7 +99,6 @@ impl StateHandler<WorkerMessage, WorkerState> for WorkerActor {
         info.msg_count += 1;
         info.last_msg = msg.text.clone();
         info.current_state = format!("{:?}", state);
-
         self.log.lock().unwrap().push(format!(
             "[{}] '{}' received in state {:?} (#{}): {}",
             ctx.id(),
@@ -108,14 +110,137 @@ impl StateHandler<WorkerMessage, WorkerState> for WorkerActor {
     }
 }
 
-// ── Command Actor (Supervisor) ──────────────────────────────
+// ── MetaActor ───────────────────────────────────────────────
 
-struct ManagedActor {
+/// A managed worker entry tracked by the MetaActor.
+struct ManagedWorker {
     addr: Addr<WorkerSM>,
     info: Arc<Mutex<WorkerInfo>>,
     name: String,
 }
 
+/// Commands sent from CommandActor to MetaActor.
+enum MetaCommand {
+    CreateWorker { name: String },
+    DestroyWorker { id: ActorId },
+    GetWorkers,
+    GetWorkerStatus,
+    SendToWorker { id: ActorId, text: String },
+}
+
+impl Message for MetaCommand {
+    type Result = MetaResult;
+}
+
+/// Results returned from MetaActor to CommandActor.
+enum MetaResult {
+    Created { id: ActorId, name: String },
+    Destroyed { id: ActorId, name: String, msg_count: usize, state: String },
+    WorkerList(Vec<(ActorId, String)>),
+    WorkerStatus(Vec<WorkerSnapshot>),
+    MessageSent { id: ActorId, name: String },
+    Err(String),
+}
+
+#[derive(Debug, Clone)]
+struct WorkerSnapshot {
+    id: ActorId,
+    name: String,
+    msg_count: usize,
+    state: String,
+    last_msg: String,
+}
+
+struct MetaActor {
+    workers: HashMap<ActorId, ManagedWorker>,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Actor for MetaActor {
+    fn started(&mut self, _ctx: &mut Context) {
+        self.log.lock().unwrap().push("[MetaActor] started".into());
+    }
+    fn stopped(&mut self, _ctx: &mut Context) {
+        self.log.lock().unwrap().push("[MetaActor] stopped".into());
+    }
+}
+
+impl Handler<MetaCommand> for MetaActor {
+    fn handle(&mut self, cmd: MetaCommand, ctx: &mut Context) -> MetaResult {
+        match cmd {
+            MetaCommand::CreateWorker { name } => {
+                let info = Arc::new(Mutex::new(WorkerInfo {
+                    name: name.clone(),
+                    msg_count: 0,
+                    last_msg: String::new(),
+                    current_state: "Idle".into(),
+                }));
+                let worker = WorkerActor {
+                    info: info.clone(),
+                    log: self.log.clone(),
+                };
+                let sm = StateMachine::new(worker);
+                let addr = ctx.spawn(sm);
+                let id = addr.id();
+                self.workers.insert(id, ManagedWorker { addr, info, name: name.clone() });
+                MetaResult::Created { id, name }
+            }
+            MetaCommand::DestroyWorker { id } => {
+                if let Some(worker) = self.workers.remove(&id) {
+                    let info = worker.info.lock().unwrap();
+                    MetaResult::Destroyed {
+                        id,
+                        name: worker.name.clone(),
+                        msg_count: info.msg_count,
+                        state: info.current_state.clone(),
+                    }
+                } else {
+                    MetaResult::Err(format!("Worker {} not found", id))
+                }
+            }
+            MetaCommand::GetWorkers => {
+                let list: Vec<_> = self
+                    .workers
+                    .iter()
+                    .map(|(id, w)| (*id, w.name.clone()))
+                    .collect();
+                MetaResult::WorkerList(list)
+            }
+            MetaCommand::GetWorkerStatus => {
+                let snapshots: Vec<_> = self
+                    .workers
+                    .iter()
+                    .map(|(id, w)| {
+                        let info = w.info.lock().unwrap();
+                        WorkerSnapshot {
+                            id: *id,
+                            name: w.name.clone(),
+                            msg_count: info.msg_count,
+                            state: info.current_state.clone(),
+                            last_msg: info.last_msg.clone(),
+                        }
+                    })
+                    .collect();
+                MetaResult::WorkerStatus(snapshots)
+            }
+            MetaCommand::SendToWorker { id, text } => {
+                if let Some(worker) = self.workers.get(&id) {
+                    let _ = worker.addr.do_send(WorkerMessage { text });
+                    MetaResult::MessageSent {
+                        id,
+                        name: worker.name.clone(),
+                    }
+                } else {
+                    MetaResult::Err(format!("Worker {} not found", id))
+                }
+            }
+        }
+    }
+}
+
+// ── Command Actor ───────────────────────────────────────────
+
+/// Commands from stdin thread.
 enum ConsoleCommand {
     Spawn { name: String },
     Stop { id: ActorId },
@@ -135,95 +260,96 @@ enum ConsoleResult {
     Quit,
 }
 
-impl Handler<ConsoleCommand> for CommandActor {
-    fn handle(&mut self, cmd: ConsoleCommand, ctx: &mut Context) -> ConsoleResult {
-        match cmd {
-            ConsoleCommand::Spawn { name } => {
-                let info = Arc::new(Mutex::new(WorkerInfo {
-                    name: name.clone(),
-                    msg_count: 0,
-                    last_msg: String::new(),
-                    current_state: "Idle".into(),
-                }));
-                let worker = WorkerActor {
-                    info: info.clone(),
-                    log: self.log.clone(),
-                };
-                let sm = StateMachine::new(worker);
-                let addr = ctx.spawn(sm);
-                let id = addr.id();
-                self.actors.insert(id, ManagedActor {
-                    addr,
-                    info,
-                    name: name.clone(),
-                });
-                ConsoleResult::Ok(format!("Spawned actor '{}' with ID {} (state: Idle)", name, id))
-            }
-            ConsoleCommand::Stop { id } => {
-                if let Some(managed) = self.actors.remove(&id) {
-                    let info = managed.info.lock().unwrap();
-                    ConsoleResult::Ok(format!(
-                        "Stopped actor '{}' ({}) — {} msg(s), last state: {}",
-                        managed.name, id, info.msg_count, info.current_state
-                    ))
-                } else {
-                    ConsoleResult::Err(format!("Actor {} not found", id))
-                }
-            }
-            ConsoleCommand::Send { id, text } => {
-                if let Some(managed) = self.actors.get(&id) {
-                    let name = managed.name.clone();
-                    let _ = managed.addr.do_send(WorkerMessage { text });
-                    ConsoleResult::Ok(format!("Message sent to '{}' ({})", name, id))
-                } else {
-                    ConsoleResult::Err(format!("Actor {} not found", id))
-                }
-            }
-            ConsoleCommand::Status => {
-                let mut lines = vec![];
-                for (id, managed) in &self.actors {
-                    let info = managed.info.lock().unwrap();
-                    lines.push(format!(
-                        "  {} '{}' — {} msg(s), state: {}, last: \"{}\"",
-                        id, managed.name, info.msg_count, info.current_state, info.last_msg
-                    ));
-                }
-                if lines.is_empty() {
-                    ConsoleResult::Ok("No actors running.".into())
-                } else {
-                    ConsoleResult::Ok(format!(
-                        "{} actor(s) running:\n{}",
-                        lines.len(),
-                        lines.join("\n")
-                    ))
-                }
-            }
-            ConsoleCommand::List => {
-                if self.actors.is_empty() {
-                    ConsoleResult::Ok("No actors.".into())
-                } else {
-                    let ids: Vec<String> = self
-                        .actors
-                        .iter()
-                        .map(|(id, m)| format!("{} ({})", m.name, id))
-                        .collect();
-                    ConsoleResult::Ok(format!("Actors: {}", ids.join(", ")))
-                }
-            }
-            ConsoleCommand::Quit => ConsoleResult::Quit,
-        }
-    }
-}
-
 struct CommandActor {
-    actors: HashMap<ActorId, ManagedActor>,
-    log: Arc<Mutex<Vec<String>>>,
+    meta: Addr<MetaActor>,
 }
 
 impl Actor for CommandActor {
     fn started(&mut self, _ctx: &mut Context) {
-        println!("=== Actinium-Actor Console (State Machine) ===");
+        println!("=== Actinium-Actor Console ===");
         println!("Type 'help' for available commands.\n");
+    }
+}
+
+impl Handler<ConsoleCommand> for CommandActor {
+    fn handle(&mut self, cmd: ConsoleCommand, ctx: &mut Context) -> ConsoleResult {
+        match cmd {
+            ConsoleCommand::Spawn { name } => {
+                match ctx.send(&self.meta, MetaCommand::CreateWorker { name }) {
+                    Ok(MetaResult::Created { id, name }) => {
+                        ConsoleResult::Ok(format!("Spawned '{}' with ID {}", name, id))
+                    }
+                    Ok(MetaResult::Err(e)) => ConsoleResult::Err(e),
+                    _ => ConsoleResult::Err("meta actor error".into()),
+                }
+            }
+            ConsoleCommand::Stop { id } => {
+                match ctx.send(&self.meta, MetaCommand::DestroyWorker { id }) {
+                    Ok(MetaResult::Destroyed { id, name, msg_count, state }) => {
+                        ConsoleResult::Ok(format!(
+                            "Stopped '{}' ({}) — {} msg(s), last state: {}",
+                            name, id, msg_count, state
+                        ))
+                    }
+                    Ok(MetaResult::Err(e)) => ConsoleResult::Err(e),
+                    _ => ConsoleResult::Err("meta actor error".into()),
+                }
+            }
+            ConsoleCommand::Send { id, text } => {
+                match ctx.send(&self.meta, MetaCommand::SendToWorker {
+                    id,
+                    text: text.clone(),
+                }) {
+                    Ok(MetaResult::MessageSent { id, name }) => {
+                        ConsoleResult::Ok(format!("Message sent to '{}' ({})", name, id))
+                    }
+                    Ok(MetaResult::Err(e)) => ConsoleResult::Err(e),
+                    _ => ConsoleResult::Err("meta actor error".into()),
+                }
+            }
+            ConsoleCommand::Status => {
+                match ctx.send(&self.meta, MetaCommand::GetWorkerStatus) {
+                    Ok(MetaResult::WorkerStatus(snapshots)) => {
+                        if snapshots.is_empty() {
+                            ConsoleResult::Ok("No actors running.".into())
+                        } else {
+                            let lines: Vec<String> = snapshots
+                                .iter()
+                                .map(|s| {
+                                    format!(
+                                        "  {} '{}' — {} msg(s), state: {}, last: \"{}\"",
+                                        s.id, s.name, s.msg_count, s.state, s.last_msg
+                                    )
+                                })
+                                .collect();
+                            ConsoleResult::Ok(format!(
+                                "{} actor(s) running:\n{}",
+                                snapshots.len(),
+                                lines.join("\n")
+                            ))
+                        }
+                    }
+                    _ => ConsoleResult::Err("meta actor error".into()),
+                }
+            }
+            ConsoleCommand::List => {
+                match ctx.send(&self.meta, MetaCommand::GetWorkers) {
+                    Ok(MetaResult::WorkerList(list)) => {
+                        if list.is_empty() {
+                            ConsoleResult::Ok("No actors.".into())
+                        } else {
+                            let ids: Vec<String> = list
+                                .iter()
+                                .map(|(id, name)| format!("{} ({})", name, id))
+                                .collect();
+                            ConsoleResult::Ok(format!("Actors: {}", ids.join(", ")))
+                        }
+                    }
+                    _ => ConsoleResult::Err("meta actor error".into()),
+                }
+            }
+            ConsoleCommand::Quit => ConsoleResult::Quit,
+        }
     }
 }
 
@@ -233,12 +359,20 @@ fn main() {
     let rt = Runtime::with_threads(2);
     let log = Arc::new(Mutex::new(Vec::new()));
 
-    let cmd_actor = CommandActor {
-        actors: HashMap::new(),
+    // 1. Spawn MetaActor first (auto-started, manages worker lifecycle)
+    let meta = MetaActor {
+        workers: HashMap::new(),
         log: log.clone(),
+    };
+    let meta_addr = rt.spawn(meta);
+
+    // 2. Spawn CommandActor with reference to MetaActor
+    let cmd_actor = CommandActor {
+        meta: meta_addr.clone(),
     };
     let cmd_addr = rt.spawn(cmd_actor);
 
+    // 3. Stdin thread sends commands to CommandActor
     let cmd_addr_clone = cmd_addr.clone();
     let stdin_handle = thread::spawn(move || {
         let stdin = io::stdin();
@@ -271,6 +405,7 @@ fn main() {
 
     stdin_handle.join().unwrap();
     drop(cmd_addr);
+    drop(meta_addr);
     drop(rt);
 
     let log_entries = log.lock().unwrap();
@@ -322,7 +457,10 @@ fn process_command(cmd_addr: &Addr<CommandActor>, input: &str) -> ConsoleResult 
             }
             match parts[1].parse::<u64>() {
                 Ok(raw_id) => cmd_addr
-                    .send(ConsoleCommand::Send { id: ActorId::from_raw(raw_id), text: parts[2].to_string() })
+                    .send(ConsoleCommand::Send {
+                        id: ActorId::from_raw(raw_id),
+                        text: parts[2].to_string(),
+                    })
                     .unwrap_or(ConsoleResult::Err("send failed".into())),
                 Err(_) => ConsoleResult::Err("Invalid actor ID".into()),
             }
