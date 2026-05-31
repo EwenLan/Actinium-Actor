@@ -61,14 +61,29 @@
 
 ---
 
-## Phase 3: Scheduler 🔜
+## Phase 3: Scheduler ✅
 
-**Goal**: Support cooperative scheduling within each worker. Each worker's event loop processes messages from its assigned actors in round-robin fashion. Actors yield after processing each message.
+**Status**: Complete
 
-**Pending**:
-- [ ] Per-worker message queue with round-robin dispatch
-- [ ] Fair scheduling when more actors than threads
-- [ ] Tests for scheduling fairness
+### New Modules
+| File | Purpose |
+|------|---------|
+| `src/scheduler.rs` | `Scheduler` — per-actor mailboxes with round-robin dispatch |
+
+### Design
+- Each actor has a `VecDeque<Envelope>` mailbox managed by the scheduler
+- `ready_queue` tracks actors with pending messages in FIFO order
+- `next_ready()` pops the next actor and dispatches one message
+- After dispatch, actor is re-queued if more messages remain
+- Guarantees no actor starves: each actor gets one message per turn
+
+### Tests: 6 new (26 total across all modules)
+- Enqueue and dequeue messages
+- Round-robin ordering between multiple actors
+- Round-robin fairness (3 actors, 2 messages each → 1,2,3,1,2,3)
+- Actor removal cleans up mailbox and ready queue
+- Duplicate enqueue only adds actor once to ready queue
+- Integration test: fairness in live runtime with single worker
 
 ---
 

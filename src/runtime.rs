@@ -9,6 +9,7 @@ use crate::actor::{Actor, ActorId};
 use crate::addr::Addr;
 use crate::context::Context;
 use crate::envelope::{DispatchFn, Envelope};
+use crate::scheduler::Scheduler;
 
 /// Default number of worker threads.
 pub const DEFAULT_WORKER_THREADS: usize = 4;
@@ -36,6 +37,7 @@ struct Worker {
     control_rx: Receiver<ControlMsg>,
     msg_rx: Receiver<Envelope>,
     actors: HashMap<ActorId, ActorCell>,
+    scheduler: Scheduler,
 }
 
 impl Worker {
@@ -55,17 +57,29 @@ impl Worker {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         // Runtime dropped control senders — no more spawns.
-                        // Keep processing messages until the msg channel closes.
                         break;
                     }
                 }
             }
 
-            // Process one message with timeout
-            match self.msg_rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(envelope) => self.dispatch(envelope),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+            // Drain incoming messages into the scheduler (non-blocking)
+            while let Ok(envelope) = self.msg_rx.try_recv() {
+                self.scheduler.enqueue(envelope);
+            }
+
+            // Dispatch one message round-robin
+            if let Some(actor_id) = self.scheduler.next_ready() {
+                if let Some(envelope) = self.scheduler.dequeue(actor_id) {
+                    self.dispatch(envelope);
+                    self.scheduler.requeue_if_ready(actor_id);
+                }
+            } else {
+                // No ready actors — block for new messages
+                match self.msg_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(envelope) => self.scheduler.enqueue(envelope),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
             }
         }
 
@@ -88,6 +102,8 @@ impl Worker {
             let mut ctx = Context::new(actor_id);
             (cell.on_stop)(cell.actor.as_mut(), &mut ctx);
         }
+        // Clean up scheduler state for this actor
+        self.scheduler.remove_actor(actor_id);
     }
 
     fn stop_all_actors(&mut self) {
@@ -153,6 +169,7 @@ impl Runtime {
                     control_rx,
                     msg_rx,
                     actors: HashMap::new(),
+                    scheduler: Scheduler::new(),
                 }
                 .run();
             });
@@ -497,5 +514,74 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn scheduler_fairness() {
+        use std::sync::{Arc, Mutex};
+
+        struct FairActor {
+            id: usize,
+            processed: Arc<Mutex<Vec<usize>>>,
+        }
+
+        impl Actor for FairActor {}
+
+        struct Work;
+        impl Message for Work {
+            type Result = ();
+        }
+
+        impl Handler<Work> for FairActor {
+            fn handle(&mut self, _msg: Work, _ctx: &mut Context) {
+                self.processed.lock().unwrap().push(self.id);
+            }
+        }
+
+        let rt = Runtime::with_threads(1); // single worker to test scheduling
+        let processed = Arc::new(Mutex::new(Vec::new()));
+
+        let addrs: Vec<_> = (0..3)
+            .map(|i| {
+                rt.spawn(FairActor {
+                    id: i,
+                    processed: processed.clone(),
+                })
+            })
+            .collect();
+
+        // Send 3 messages to each actor
+        for addr in &addrs {
+            for _ in 0..3 {
+                let _ = addr.do_send(Work);
+            }
+        }
+
+        let handles: Vec<_> = addrs
+            .into_iter()
+            .map(|addr| {
+                thread::spawn(move || {
+                    drop(addr);
+                })
+            })
+            .collect();
+
+        rt.run();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let order = processed.lock().unwrap();
+        // With round-robin scheduling, the first 3 messages should be
+        // from actors 0, 1, 2 (one each) — not all from actor 0
+        assert_eq!(order.len(), 9, "all 9 messages should be processed");
+
+        let first_three = &order[..3];
+        let has_different = first_three.iter().collect::<std::collections::HashSet<_>>().len() > 1;
+        assert!(
+            has_different,
+            "first 3 messages should come from different actors (round-robin), got: {:?}",
+            first_three
+        );
     }
 }

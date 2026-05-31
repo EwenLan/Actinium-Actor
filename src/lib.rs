@@ -3,6 +3,7 @@ pub mod addr;
 pub mod context;
 pub mod envelope;
 pub mod runtime;
+pub(crate) mod scheduler;
 pub mod system;
 
 pub use actor::{Actor, ActorId, Handler, Message};

@@ -69,8 +69,7 @@ fn main() {
         .into_iter()
         .map(|addr| {
             thread::spawn(move || {
-                let result = addr.send(DoWork { duration_ms: 100 }).unwrap();
-                assert_eq!(result, result); // just verify we got a response
+                let _result = addr.send(DoWork { duration_ms: 100 }).unwrap();
                 drop(addr);
             })
         })
