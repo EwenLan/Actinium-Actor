@@ -6,6 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct ActorId(pub(crate) u64);
 
 impl ActorId {
+    /// Create an ActorId from a raw u64 value.
+    pub fn from_raw(id: u64) -> Self {
+        ActorId(id)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn next() -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(1);

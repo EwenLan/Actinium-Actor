@@ -103,7 +103,7 @@ fn test_multiple_workers() {
         .map(|addr| {
             thread::spawn(move || {
                 let _ = addr.do_send(DoWork {
-                    text: format!("task"),
+                    text: "task".to_string(),
                 });
                 drop(addr);
             })
