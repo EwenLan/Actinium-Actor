@@ -165,9 +165,55 @@ assert!(probe.any_match(|m| m.field == expected));
 - Spawn custom actor in TestKit
 - **4 integration tests**: worker→probe, multiple workers, type filtering, actor chain
 
-## Summary
+---
 
-All 5 phases complete. 41 tests passing, zero warnings.
+## Phase 6: State Machine ✅
+
+**Status**: Complete
+
+### New Modules
+| File | Purpose |
+|------|---------|
+| `src/stateful.rs` | `StateHandler` trait + `StateMachine<A, M, S>` wrapper |
+
+### Design
+- `StateHandler<M, S>` trait: user defines states, message type, and per-state handlers
+- `StateMachine<A, M, S>` wraps an actor, implementing `Actor` and `Handler<M>`
+- After each message, auto-advances to the next state; cycles back after the last
+- Lifecycle hooks (`started`/`stopped`) are delegated to the inner actor
+
+### API
+```rust
+#[derive(Clone)]
+enum DocState { Receive, Validate, Process, Archive }
+
+impl StateHandler<Document, DocState> for PipelineActor {
+    fn initial_state() -> DocState { DocState::Receive }
+    fn state_sequence() -> Vec<DocState> {
+        vec![DocState::Receive, DocState::Validate, DocState::Process, DocState::Archive]
+    }
+    fn handle_in_state(&mut self, idx: usize, state: &DocState, msg: Document, ctx: &mut Context) -> String {
+        match state { ... }
+    }
+}
+
+let sm = StateMachine::new(pipeline_actor);
+let addr = rt.spawn(sm);
+```
+
+### Tests: 7 new (48 total across all targets)
+- Starts at initial state
+- Cycles through states correctly
+- Multiple complete cycles
+- Transition log records all states
+- Lifecycle hooks delegated
+- Empty state sequence panics
+- `into_inner()` returns inner actor
+
+### Example
+- `examples/state_machine.rs` — 4-state document pipeline, 2 complete cycles
+
+## Summary
 
 | Phase | Feature | Tests |
 |-------|---------|-------|
@@ -176,7 +222,8 @@ All 5 phases complete. 41 tests passing, zero warnings.
 | 3 | Round-robin Scheduler | 6 |
 | 4 | Supervisor + Context::spawn | 6 |
 | 5 | Integration Test Framework | 9 |
-| **Total** | | **41** |
+| 6 | State Machine | 7 |
+| **Total** | | **48** |
 
 ---
 
