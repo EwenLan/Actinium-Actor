@@ -1,82 +1,111 @@
+//! Ping-pong using the state machine mechanism.
+//!
+//! Two actors cycle through states independently:
+//!   Ping → Pong → Ping → Pong → ...
+//!
+//! Each actor processes one message per state, then auto-advances.
+//! After 4 messages, each actor has completed 2 full cycles.
+
 use std::thread;
 
-use actinium_actor::{Actor, ActorSystem, Context, Handler, Message};
+use actinium_actor::{
+    Actor, ActorSystem, Context, Message, StateHandler, StateMachine,
+};
 
-// ── Ping Actor ──────────────────────────────────────────────
+// ── States ──────────────────────────────────────────────────
 
-struct PingActor {
-    count: usize,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RallyState {
+    Ping,
+    Pong,
 }
 
-impl Actor for PingActor {}
+// ── Message ─────────────────────────────────────────────────
 
-struct Ping {
-    reply_to: actinium_actor::Addr<PongActor>,
-    text: String,
+struct Rally {
+    player: String,
+    round: usize,
 }
 
-impl Message for Ping {
-    type Result = usize;
+impl Message for Rally {
+    type Result = String;
 }
 
-impl Handler<Ping> for PingActor {
-    fn handle(&mut self, msg: Ping, ctx: &mut Context) -> usize {
-        println!("Ping received: {}", msg.text);
-        self.count += 1;
-        // Notify the pong actor asynchronously
-        ctx.notify(&msg.reply_to, Pong {
-            reply_to: ctx.id(),
-            text: format!("pong-{}", self.count),
-        });
-        self.count
+// ── Rally Actor ─────────────────────────────────────────────
+
+struct RallyActor {
+    name: String,
+}
+
+impl Actor for RallyActor {}
+
+impl StateHandler<Rally, RallyState> for RallyActor {
+    fn initial_state() -> RallyState {
+        RallyState::Ping
     }
-}
 
-// ── Pong Actor ──────────────────────────────────────────────
+    fn state_sequence() -> Vec<RallyState> {
+        vec![RallyState::Ping, RallyState::Pong]
+    }
 
-struct PongActor {
-    count: usize,
-}
-
-impl Actor for PongActor {}
-
-struct Pong {
-    reply_to: actinium_actor::ActorId,
-    text: String,
-}
-
-impl Message for Pong {
-    type Result = ();
-}
-
-impl Handler<Pong> for PongActor {
-    fn handle(&mut self, msg: Pong, _ctx: &mut Context) {
-        println!("Pong received: {} (from {})", msg.text, msg.reply_to);
-        self.count += 1;
+    fn handle_in_state(
+        &mut self,
+        idx: usize,
+        state: &RallyState,
+        msg: Rally,
+        _ctx: &mut Context,
+    ) -> String {
+        match state {
+            RallyState::Ping => {
+                format!(
+                    "[{}] PING  ← round {} from {} (state {})",
+                    self.name, msg.round, msg.player, idx
+                )
+            }
+            RallyState::Pong => {
+                format!(
+                    "[{}] PONG  ← round {} from {} (state {})",
+                    self.name, msg.round, msg.player, idx
+                )
+            }
+        }
     }
 }
 
 fn main() {
     let mut system = ActorSystem::new();
 
-    let pong = system.spawn(PongActor { count: 0 });
-    let ping = system.spawn(PingActor { count: 0 });
+    // Wrap each actor in a state machine and spawn
+    let alice_sm = StateMachine::new(RallyActor {
+        name: "Alice".into(),
+    });
+    let alice = system.spawn(alice_sm);
 
-    // Move addresses into the sender thread so the channel closes when done.
+    let bob_sm = StateMachine::new(RallyActor {
+        name: "Bob".into(),
+    });
+    let bob = system.spawn(bob_sm);
+
+    println!("=== Ping-Pong State Machine ===\n");
+
     let sender = thread::spawn(move || {
-        for i in 1..=3 {
-            ping.send(Ping {
-                reply_to: pong.clone(),
-                text: format!("ping-{}", i),
-            })
-            .unwrap();
+        for round in 1..=4 {
+            let result = alice
+                .send(Rally { player: "alice".into(), round })
+                .unwrap();
+            println!("  {}", result);
+
+            let result = bob
+                .send(Rally { player: "bob".into(), round })
+                .unwrap();
+            println!("  {}", result);
         }
-        drop(ping);
-        drop(pong);
+        drop(alice);
+        drop(bob);
     });
 
     system.run();
     sender.join().unwrap();
 
-    println!("Ping pong exchange complete.");
+    println!("\n=== Complete: 4 rounds × 2 players = 8 messages, 2 full state cycles each ===");
 }

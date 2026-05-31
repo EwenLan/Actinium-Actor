@@ -1,12 +1,38 @@
-//! Demonstrates multi-threaded actor execution.
+//! Multi-threaded state machine demo.
 //!
-//! Spawns actors across configurable worker threads and shows concurrent
-//! message processing with more actors than threads.
+//! Each worker cycles through 3 states:
+//!   Receive → Execute → Report → Receive → ...
+//!
+//! Spawns more actors than threads to demonstrate concurrent state processing.
 
 use std::thread;
 use std::time::{Duration, Instant};
 
-use actinium_actor::{Actor, Context, Handler, Message, Runtime, DEFAULT_WORKER_THREADS};
+use actinium_actor::{
+    Actor, Context, Message, Runtime, StateHandler, StateMachine, DEFAULT_WORKER_THREADS,
+};
+
+// ── States ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskState {
+    /// Accept a task.
+    Receive,
+    /// Execute the task (simulate work).
+    Execute,
+    /// Report completion.
+    Report,
+}
+
+// ── Message ─────────────────────────────────────────────────
+
+struct Task {
+    duration_ms: u64,
+}
+
+impl Message for Task {
+    type Result = String;
+}
 
 // ── Worker Actor ────────────────────────────────────────────
 
@@ -16,77 +42,108 @@ struct WorkerActor {
 
 impl Actor for WorkerActor {
     fn started(&mut self, _ctx: &mut Context) {
-        println!("WorkerActor-{} started", self.id);
+        println!("Worker-{} started", self.id);
     }
     fn stopped(&mut self, _ctx: &mut Context) {
-        println!("WorkerActor-{} stopped", self.id);
+        println!("Worker-{} stopped", self.id);
     }
 }
 
-struct DoWork {
-    duration_ms: u64,
-}
+impl StateHandler<Task, TaskState> for WorkerActor {
+    fn initial_state() -> TaskState {
+        TaskState::Receive
+    }
 
-impl Message for DoWork {
-    type Result = usize;
-}
+    fn state_sequence() -> Vec<TaskState> {
+        vec![TaskState::Receive, TaskState::Execute, TaskState::Report]
+    }
 
-impl Handler<DoWork> for WorkerActor {
-    fn handle(&mut self, msg: DoWork, _ctx: &mut Context) -> usize {
-        println!(
-            "WorkerActor-{} working for {}ms on thread {:?}",
-            self.id,
-            msg.duration_ms,
-            thread::current().id()
-        );
-        thread::sleep(Duration::from_millis(msg.duration_ms));
-        self.id
+    fn handle_in_state(
+        &mut self,
+        _idx: usize,
+        state: &TaskState,
+        msg: Task,
+        _ctx: &mut Context,
+    ) -> String {
+        match state {
+            TaskState::Receive => {
+                format!(
+                    "[W-{}] RECEIVED task ({}ms) on {:?}",
+                    self.id,
+                    msg.duration_ms,
+                    thread::current().id()
+                )
+            }
+            TaskState::Execute => {
+                println!(
+                    "[W-{}] EXECUTING for {}ms on {:?}",
+                    self.id,
+                    msg.duration_ms,
+                    thread::current().id()
+                );
+                thread::sleep(Duration::from_millis(msg.duration_ms));
+                format!("[W-{}] execution complete", self.id)
+            }
+            TaskState::Report => {
+                format!(
+                    "[W-{}] REPORTING done on {:?}",
+                    self.id,
+                    thread::current().id()
+                )
+            }
+        }
     }
 }
 
 fn main() {
     let num_threads = DEFAULT_WORKER_THREADS;
-    let num_actors = 8; // more actors than threads
+    let num_actors = 4; // 4 actors in parallel
+    let msgs_per_actor = 3; // one per state (Receive, Execute, Report)
 
     println!(
-        "=== Multi-Threaded Actor Demo ===\n\
-         Runtime threads: {}\n\
-         Actors:           {}\n",
-        num_threads, num_actors
+        "=== Multi-Threaded State Machine Demo ===\n\
+         Threads: {}, Actors: {}, Messages per actor: {}\n",
+        num_threads, num_actors, msgs_per_actor
     );
 
     let rt = Runtime::with_threads(num_threads);
 
-    // Spawn actors
+    // Spawn state-machine actors
     let addrs: Vec<_> = (0..num_actors)
-        .map(|i| rt.spawn(WorkerActor { id: i }))
+        .map(|i| {
+            let worker = WorkerActor { id: i };
+            let sm = StateMachine::new(worker);
+            rt.spawn(sm)
+        })
         .collect();
 
     let start = Instant::now();
 
-    // Send work to all actors concurrently
+    // Send 3 tasks to each actor (one for each state)
     let handles: Vec<_> = addrs
         .into_iter()
         .map(|addr| {
             thread::spawn(move || {
-                let _result = addr.send(DoWork { duration_ms: 100 }).unwrap();
+                for _ in 0..msgs_per_actor {
+                    let _result = addr
+                        .send(Task {
+                            duration_ms: 50,
+                        })
+                        .unwrap();
+                }
                 drop(addr);
             })
         })
         .collect();
 
-    println!("All messages sent, waiting for completion...");
     rt.run();
-
     for h in handles {
         h.join().unwrap();
     }
 
     let elapsed = start.elapsed();
     println!(
-        "\nAll {} actors completed in {:?} (serial would be ~{}ms)",
-        num_actors,
-        elapsed,
-        num_actors * 100
+        "\n{} actors × {} states completed in {:?}",
+        num_actors, msgs_per_actor, elapsed
     );
 }
