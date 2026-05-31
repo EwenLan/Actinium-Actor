@@ -125,14 +125,58 @@ sup.handle_failure(failed_id, ctx);  // restart on failure
 
 ---
 
-## Phase 5: Integration Test Framework 🔜
+## Phase 5: Integration Test Framework ✅
 
-**Goal**: Test utilities for spawning actors, stubbing, and asserting on message flow.
+**Status**: Complete
 
-**Pending**:
-- [ ] `TestKit` for isolated actor testing
-- [ ] `StubHandle` for message interception
-- [ ] Integration tests for full actor flows
+### New Modules
+| File | Purpose |
+|------|---------|
+| `src/testkit.rs` | `TestKit`, `TestProbe<M>`, `ProbeActor<M>` |
+
+### Design
+- `TestKit` wraps `ActorSystem` for deterministic single-threaded testing
+- `TestProbe<M>` records messages of type `M` for test assertions
+- `ProbeActor<M>` is the underlying actor that collects messages
+- `run_until_idle()` drains all pending messages synchronously
+- Messages are stored in `Arc<Mutex<Vec<M>>>` for cross-thread access
+
+### API
+```rust
+let mut kit = TestKit::new();
+let probe = kit.spawn_probe::<MyMessage>();
+let actor = kit.spawn(MyActor { output: probe.recipient() });
+
+// Send messages from another thread
+thread::spawn(move || { actor.do_send(msg); drop(actor); });
+
+kit.run_until_idle();
+
+// Assert
+assert_eq!(probe.count(), 1);
+assert!(probe.any_match(|m| m.field == expected));
+```
+
+### Tests: 5 new (41 total across all targets)
+- Probe receives messages
+- Count and first message retrieval
+- Probe reset clears messages
+- any_match predicate filtering
+- Spawn custom actor in TestKit
+- **4 integration tests**: worker→probe, multiple workers, type filtering, actor chain
+
+## Summary
+
+All 5 phases complete. 41 tests passing, zero warnings.
+
+| Phase | Feature | Tests |
+|-------|---------|-------|
+| 1 | Core traits + Single-threaded runtime | 11 |
+| 2 | Multi-threaded Runtime | 9 |
+| 3 | Round-robin Scheduler | 6 |
+| 4 | Supervisor + Context::spawn | 6 |
+| 5 | Integration Test Framework | 9 |
+| **Total** | | **41** |
 
 ---
 
