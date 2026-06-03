@@ -3,23 +3,24 @@
 //! Architecture:
 //!   main ──spawn──> MetaActor ──spawn──> CommandActor
 //!                       │                    │
-//!                       │  do_send / notify  │
-//!                       └────────────────────┘
-//!                       │
-//!                   ctx.spawn
-//!                       ▼
-//!                  WorkerActor(s)
+//!                       │    do_send/notify   │
+//!                       │   (lifecycle only)  │
+//!                       │                    │
+//!                   ctx.spawn         direct send
+//!                       ▼                    ▼
+//!                  WorkerActor(s) <──────────┘
+//!                       ▲
+//!                       └── WorkerRegistry (Arc<Mutex<>>)
+//!                           Shared: MetaActor writes, CommandActor reads
 //!
-//! MetaActor is the root: it auto-spawns CommandActor on startup and
-//! manages all worker lifecycle. Communication uses fire-and-forget
-//! (do_send / notify) to avoid same-worker deadlocks. Responses come
-//! back asynchronously via CmdResponse messages.
+//! Inter-actor messages go directly via Addr<A>::do_send(), not through
+//! MetaActor. MetaActor only handles lifecycle (create/destroy workers).
 //!
 //! Commands:
-//!   spawn <name>     Create a worker
-//!   stop <id>        Stop a worker
-//!   send <id> <msg>  Send message to a worker
-//!   status           Show all workers
+//!   spawn <name>     Create a worker (via MetaActor)
+//!   stop <id>        Stop a worker (via MetaActor)
+//!   send <id> <msg>  Send message to a worker (direct, point-to-point)
+//!   status           Show all workers (reads shared registry)
 //!   list             List all workers
 //!   help             Show help
 //!   quit             Shutdown
@@ -37,11 +38,7 @@ use actinium_actor::{
 // ── Worker States ───────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkerState {
-    Idle,
-    Receiving,
-    Processing,
-}
+enum WorkerState { Idle, Receiving, Processing }
 
 // ── Worker Actor ────────────────────────────────────────────
 
@@ -94,7 +91,7 @@ impl StateHandler<WorkerMessage, WorkerState> for WorkerActor {
     }
 }
 
-// ── MetaActor ───────────────────────────────────────────────
+// ── Worker Registry (shared, point-to-point) ────────────────
 
 struct ManagedWorker {
     addr: Addr<WorkerSM>,
@@ -102,21 +99,22 @@ struct ManagedWorker {
     name: String,
 }
 
-/// Fire-and-forget commands from CommandActor to MetaActor.
+/// Shared registry: MetaActor writes, CommandActor reads for direct messaging.
+type WorkerRegistry = Arc<Mutex<HashMap<ActorId, ManagedWorker>>>;
+
+// ── MetaActor ───────────────────────────────────────────────
+
+/// MetaActor only handles lifecycle: create and destroy workers.
 enum MetaCommand {
     CreateWorker { name: String },
     DestroyWorker { id: ActorId },
-    SendToWorker { id: ActorId, text: String },
-    GetStatus,
-    GetList,
 }
 
 impl Message for MetaCommand { type Result = (); }
 
 struct MetaActor {
-    workers: HashMap<ActorId, ManagedWorker>,
+    registry: WorkerRegistry,
     cmd_addr: Option<Addr<CommandActor>>,
-    /// Shared holder so main thread can get CommandActor's Addr after bootstrap.
     cmd_addr_holder: Arc<Mutex<Option<Addr<CommandActor>>>>,
     log: Arc<Mutex<Vec<String>>>,
 }
@@ -125,25 +123,14 @@ impl Actor for MetaActor {
     fn started(&mut self, ctx: &mut Context) {
         self.log.lock().unwrap().push("[MetaActor] started".into());
 
-        // Spawn CommandActor — MetaActor is responsible for its lifecycle
-        let response_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let cmd = CommandActor {
             meta: None,
+            registry: self.registry.clone(),
             log: self.log.clone(),
-            last_response: response_cell.clone(),
+            last_response: Arc::new(Mutex::new(None)),
         };
         let cmd_addr = ctx.spawn(cmd);
-
-        // Tell CommandActor about MetaActor
-        ctx.notify(&cmd_addr, InitCommand { meta_addr: cmd_addr.id() });
-        // Actually, we need to give CommandActor MetaActor's Addr.
-        // Since we can't clone our own Addr in started, use a different approach:
-        // CommandActor gets MetaActor's Addr via the shared holder.
-        // MetaActor stores CommandActor's Addr for direct notify.
-
         self.cmd_addr = Some(cmd_addr.clone());
-
-        // Share CommandActor's Addr with main thread
         *self.cmd_addr_holder.lock().unwrap() = Some(cmd_addr);
 
         println!("=== Actinium-Actor Console ===");
@@ -164,42 +151,26 @@ impl Handler<MetaCommand> for MetaActor {
                     name: name.clone(), msg_count: 0, last_msg: String::new(),
                     current_state: "Idle".into(),
                 }));
-                let sm = StateMachine::new(WorkerActor { info: info.clone(), log: self.log.clone() });
+                let sm = StateMachine::new(WorkerActor {
+                    info: info.clone(), log: self.log.clone(),
+                });
                 let addr = ctx.spawn(sm);
                 let id = addr.id();
-                self.workers.insert(id, ManagedWorker { addr, info, name: name.clone() });
+
+                // Insert into shared registry — CommandActor can access directly
+                self.registry.lock().unwrap().insert(id, ManagedWorker {
+                    addr, info, name: name.clone(),
+                });
+
                 self.notify_cmd(ctx, CmdResponse::Spawned { id, name });
             }
             MetaCommand::DestroyWorker { id } => {
-                if let Some(w) = self.workers.remove(&id) {
+                if let Some(w) = self.registry.lock().unwrap().remove(&id) {
                     let info = w.info.lock().unwrap();
                     self.notify_cmd(ctx, CmdResponse::Stopped {
                         id, name: w.name.clone(),
                         msg_count: info.msg_count, state: info.current_state.clone(),
                     });
-                } else {
-                    self.notify_cmd(ctx, CmdResponse::Error(format!("Worker {} not found", id)));
-                }
-            }
-            MetaCommand::GetStatus => {
-                let snapshots: Vec<WorkerSnapshot> = self.workers.iter().map(|(id, w)| {
-                    let info = w.info.lock().unwrap();
-                    WorkerSnapshot {
-                        id: *id, name: w.name.clone(), msg_count: info.msg_count,
-                        state: info.current_state.clone(), last_msg: info.last_msg.clone(),
-                    }
-                }).collect();
-                self.notify_cmd(ctx, CmdResponse::Status(snapshots));
-            }
-            MetaCommand::GetList => {
-                let list: Vec<_> = self.workers.iter()
-                    .map(|(id, w)| (*id, w.name.clone())).collect();
-                self.notify_cmd(ctx, CmdResponse::List(list));
-            }
-            MetaCommand::SendToWorker { id, text } => {
-                if let Some(w) = self.workers.get(&id) {
-                    let _ = w.addr.do_send(WorkerMessage { text });
-                    self.notify_cmd(ctx, CmdResponse::MessageSent { id, name: w.name.clone() });
                 } else {
                     self.notify_cmd(ctx, CmdResponse::Error(format!("Worker {} not found", id)));
                 }
@@ -218,27 +189,14 @@ impl MetaActor {
 
 // ── CommandActor ────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-struct WorkerSnapshot {
-    id: ActorId, name: String, msg_count: usize, state: String, last_msg: String,
-}
-
-/// Async response from MetaActor back to CommandActor.
+/// Async response from MetaActor to CommandActor.
 enum CmdResponse {
     Spawned { id: ActorId, name: String },
     Stopped { id: ActorId, name: String, msg_count: usize, state: String },
-    Status(Vec<WorkerSnapshot>),
-    List(Vec<(ActorId, String)>),
-    MessageSent { id: ActorId, name: String },
     Error(String),
 }
 
 impl Message for CmdResponse { type Result = (); }
-
-/// Bootstrap: MetaActor sends this to CommandActor with its own Addr.
-struct InitCommand { meta_addr: ActorId }
-
-impl Message for InitCommand { type Result = (); }
 
 /// Commands from stdin thread.
 enum ConsoleCommand {
@@ -254,6 +212,7 @@ enum ConsoleResult { Ok(String), Quit }
 
 struct CommandActor {
     meta: Option<Addr<MetaActor>>,
+    registry: WorkerRegistry,
     log: Arc<Mutex<Vec<String>>>,
     last_response: Arc<Mutex<Option<String>>>,
 }
@@ -267,43 +226,14 @@ impl Actor for CommandActor {
     }
 }
 
-impl Handler<InitCommand> for CommandActor {
-    fn handle(&mut self, msg: InitCommand, _ctx: &mut Context) {
-        self.log.lock().unwrap().push(format!(
-            "[CommandActor] meta addr: {}", msg.meta_addr
-        ));
-    }
-}
-
 impl Handler<CmdResponse> for CommandActor {
     fn handle(&mut self, msg: CmdResponse, _ctx: &mut Context) {
         let text = match msg {
             CmdResponse::Spawned { id, name } =>
                 format!("Spawned '{}' with ID {}", name, id),
             CmdResponse::Stopped { id, name, msg_count, state } =>
-                format!("Stopped '{}' ({}) — {} msg(s), last state: {}", name, id, msg_count, state),
-            CmdResponse::Status(snapshots) => {
-                if snapshots.is_empty() {
-                    "No actors running.".into()
-                } else {
-                    let lines: Vec<String> = snapshots.iter().map(|s|
-                        format!("  {} '{}' — {} msg(s), state: {}, last: \"{}\"",
-                            s.id, s.name, s.msg_count, s.state, s.last_msg)
-                    ).collect();
-                    format!("{} actor(s) running:\n{}", snapshots.len(), lines.join("\n"))
-                }
-            }
-            CmdResponse::List(list) => {
-                if list.is_empty() {
-                    "No actors.".into()
-                } else {
-                    let ids: Vec<String> = list.iter()
-                        .map(|(id, name)| format!("{} ({})", name, id)).collect();
-                    format!("Actors: {}", ids.join(", "))
-                }
-            }
-            CmdResponse::MessageSent { id, name } =>
-                format!("Message sent to '{}' ({})", name, id),
+                format!("Stopped '{}' ({}) — {} msg(s), last state: {}",
+                    name, id, msg_count, state),
             CmdResponse::Error(e) => format!("Error: {}", e),
         };
         *self.last_response.lock().unwrap() = Some(text);
@@ -331,7 +261,8 @@ impl Handler<ConsoleCommand> for CommandActor {
                                 });
                             }
                         } else {
-                            *self.last_response.lock().unwrap() = Some("Usage: spawn <name>".into());
+                            *self.last_response.lock().unwrap() =
+                                Some("Usage: spawn <name>".into());
                         }
                     }
                     "stop" => {
@@ -343,36 +274,71 @@ impl Handler<ConsoleCommand> for CommandActor {
                                     });
                                 }
                             } else {
-                                *self.last_response.lock().unwrap() = Some("Invalid ID".into());
+                                *self.last_response.lock().unwrap() =
+                                    Some("Invalid ID".into());
                             }
                         } else {
-                            *self.last_response.lock().unwrap() = Some("Usage: stop <id>".into());
+                            *self.last_response.lock().unwrap() =
+                                Some("Usage: stop <id>".into());
                         }
                     }
                     "send" => {
                         if parts.len() >= 3 {
                             if let Ok(raw_id) = parts[1].parse::<u64>() {
-                                if let Some(ref meta) = self.meta {
-                                    ctx.notify(meta, MetaCommand::SendToWorker {
-                                        id: ActorId::from_raw(raw_id),
+                                let id = ActorId::from_raw(raw_id);
+                                // Direct point-to-point: look up Addr from registry,
+                                // send message directly to the worker actor.
+                                let registry = self.registry.lock().unwrap();
+                                if let Some(worker) = registry.get(&id) {
+                                    let _ = worker.addr.do_send(WorkerMessage {
                                         text: parts[2].to_string(),
                                     });
+                                    *self.last_response.lock().unwrap() = Some(
+                                        format!("Message sent directly to '{}' ({})", worker.name, id)
+                                    );
+                                } else {
+                                    *self.last_response.lock().unwrap() =
+                                        Some(format!("Worker {} not found", id));
                                 }
                             } else {
-                                *self.last_response.lock().unwrap() = Some("Invalid ID".into());
+                                *self.last_response.lock().unwrap() =
+                                    Some("Invalid ID".into());
                             }
                         } else {
-                            *self.last_response.lock().unwrap() = Some("Usage: send <id> <msg>".into());
+                            *self.last_response.lock().unwrap() =
+                                Some("Usage: send <id> <msg>".into());
                         }
                     }
                     "status" => {
-                        if let Some(ref meta) = self.meta {
-                            ctx.notify(meta, MetaCommand::GetStatus);
+                        // Read directly from shared registry — no MetaActor involvement
+                        let registry = self.registry.lock().unwrap();
+                        if registry.is_empty() {
+                            *self.last_response.lock().unwrap() =
+                                Some("No actors running.".into());
+                        } else {
+                            let lines: Vec<String> = registry.iter().map(|(id, w)| {
+                                let info = w.info.lock().unwrap();
+                                format!(
+                                    "  {} '{}' — {} msg(s), state: {}, last: \"{}\"",
+                                    id, w.name, info.msg_count, info.current_state, info.last_msg
+                                )
+                            }).collect();
+                            *self.last_response.lock().unwrap() = Some(format!(
+                                "{} actor(s) running:\n{}", registry.len(), lines.join("\n")
+                            ));
                         }
                     }
                     "list" => {
-                        if let Some(ref meta) = self.meta {
-                            ctx.notify(meta, MetaCommand::GetList);
+                        let registry = self.registry.lock().unwrap();
+                        if registry.is_empty() {
+                            *self.last_response.lock().unwrap() =
+                                Some("No actors.".into());
+                        } else {
+                            let ids: Vec<String> = registry.iter()
+                                .map(|(id, w)| format!("{} ({})", w.name, id))
+                                .collect();
+                            *self.last_response.lock().unwrap() =
+                                Some(format!("Actors: {}", ids.join(", ")));
                         }
                     }
                     _ => {
@@ -402,13 +368,16 @@ fn main() {
     let rt = Runtime::with_threads(2);
     let log = Arc::new(Mutex::new(Vec::new()));
 
-    // Shared holder: MetaActor writes CommandActor's Addr here during started()
+    // Shared registry: MetaActor writes, CommandActor reads for direct messaging
+    let registry: WorkerRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Bootstrap holder: MetaActor writes CommandActor's Addr here
     let cmd_addr_holder: Arc<Mutex<Option<Addr<CommandActor>>>> = Arc::new(Mutex::new(None));
     let cmd_holder_for_meta = cmd_addr_holder.clone();
 
-    // 1. Spawn MetaActor — it will auto-spawn CommandActor in started()
+    // 1. Spawn MetaActor — it auto-spawns CommandActor in started()
     let meta = MetaActor {
-        workers: HashMap::new(),
+        registry: registry.clone(),
         cmd_addr: None,
         cmd_addr_holder: cmd_holder_for_meta,
         log: log.clone(),
@@ -423,31 +392,25 @@ fn main() {
         thread::sleep(Duration::from_millis(5));
     };
 
-    // 3. Give CommandActor MetaActor's Addr (needed for notify calls)
+    // 3. Give CommandActor MetaActor's Addr
     cmd_addr.send(ConsoleCommand::SetMeta { meta_addr: meta_addr.clone() }).ok();
 
-    // 4. Stdin thread sends commands to CommandActor
+    // 4. Stdin thread
     let cmd_clone = cmd_addr.clone();
     let stdin_handle = thread::spawn(move || {
         let stdin = io::stdin();
         let reader = io::BufReader::new(stdin.lock());
-
         print_prompt();
         for line in reader.lines() {
             let line = match line { Ok(l) => l, Err(_) => break };
             let trimmed = line.trim();
             if trimmed.is_empty() { print_prompt(); continue; }
-
             if trimmed == "quit" || trimmed == "exit" {
                 let _ = cmd_clone.do_send(ConsoleCommand::Quit);
                 println!("  Shutting down...");
                 break;
             }
-
-            // Send command (async — returns immediately)
             cmd_clone.send(ConsoleCommand::Exec { input: trimmed.to_string() }).ok();
-
-            // Poll for the async response from MetaActor
             let mut attempts = 0;
             loop {
                 thread::sleep(Duration::from_millis(5));
@@ -459,12 +422,8 @@ fn main() {
                     _ => {}
                 }
                 attempts += 1;
-                if attempts > 40 {
-                    println!("  (timeout)");
-                    break;
-                }
+                if attempts > 40 { println!("  (timeout)"); break; }
             }
-
             print_prompt();
         }
         drop(cmd_clone);
